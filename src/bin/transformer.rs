@@ -46,11 +46,11 @@ fn main() {
     //eprintln!("Usage: transformer <cypher-query>");
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Requires two arguments at least : transformer <cypher-query>");
+        //eprintln!("Requires two arguments at least : transformer <cypher-query>");
         return;
     } else {
         let cypher_query = args[1..].join(" ");
-        println!("Transforming Cypher query test: {}", cypher_query);
+        //println!("Transforming Cypher query test: {}", cypher_query);
 
         /*
         let sql = if cypher_query.to_uppercase().starts_with("MATCH") {
@@ -63,16 +63,16 @@ fn main() {
         let tokens = tokenize(&cypher_query);
 
         for token in &tokens {
-            println!("{:?} => {:?}", token.tok, token.text);
+            //println!("{:?} => {:?}", token.tok, token.text);
         }
 
-        println!("--- Accessing specific token by index ---");
+        //println!("--- Accessing specific token by index ---");
 
         let i = 2;
         if let Some(token) = tokens.get(i) {
-            println!("tokens[{}] = {:?} => {:?}", i, token.tok, token.text);
+            //println!("tokens[{}] = {:?} => {:?}", i, token.tok, token.text);
         } else {
-            println!("No token at index {}", i);
+            //println!("No token at index {}", i);
         }
 
          //feature 1 : MATCH to SQL translation
@@ -93,7 +93,15 @@ fn main() {
         if token_refs.len() >= 4 {
             if token_refs[0].text == "MATCH" && token_refs[1].tok == Token::LParen {
                 // Node with label case (needs 5 tokens)
-                if token_refs.len() >= 5
+                if token_refs.len() >= 6
+                && token_refs[0].text.to_uppercase() == "MATCH"
+                && token_refs[1].tok == Token::LParen
+                && token_refs[3].tok == Token::RParen
+                && token_refs[4].text.to_uppercase() == "RETURN"
+                {
+                    sql = "SELECT * FROM nodes;".to_string();
+                }
+                else if token_refs.len() >= 5
                     && token_refs[3].tok == Token::Colon
                     && token_refs[2].text == "n"
                     && token_refs[4].tok == Token::RParen
@@ -108,7 +116,7 @@ fn main() {
             }
         }
 
-        println!("Generated SQL: {}", sql);
+        //println!("Generated SQL: {}", sql);
 
 
 
@@ -127,7 +135,7 @@ fn main() {
 
         //DETACH DELETE n => DELETE FROM nodes WHERE id = n.id; DELETE FROM edges WHERE src_id = n.id OR dst_id = n.id;
 
-        println!("Generated SQL: {}", sql);
+        println!("{}", sql);
     }
     
 }
