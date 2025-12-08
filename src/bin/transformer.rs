@@ -1,10 +1,20 @@
 use logos::Logos;
 use regex::Regex;
+use std::collections::HashMap;
 
 #[derive(Logos, Debug, PartialEq, Clone)]
 enum Token {
+    // Identifiers (keywords are still idents)
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*")]
     Ident,
+
+    // Cypher string literal: 'text' (including spaces and special chars)
+    #[regex(r"'[^']*'")]
+    StringLiteral,
+
+    // Numbers (integers and decimals)
+    #[regex(r"[0-9]+\.?[0-9]*")]
+    Number,
 
     #[token("(")]
     LParen,
@@ -18,10 +28,15 @@ enum Token {
     Colon,
     #[token("-")]
     Dash,
+    #[token("{")]
+    LBrace,
+    #[token("}")]
+    RBrace,
+    #[token(",")]
+    Comma,
 
     #[regex(r"\s+", logos::skip)]
     Whitespace,
-
 }
 
 #[derive(Debug, Clone)]
@@ -43,99 +58,161 @@ fn tokenize(input: &str) -> Vec<MyToken> {
 }
 
 fn main() {
-    //eprintln!("Usage: transformer <cypher-query>");
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        //eprintln!("Requires two arguments at least : transformer <cypher-query>");
         return;
-    } else {
-        let cypher_query = args[1..].join(" ");
-        //println!("Transforming Cypher query test: {}", cypher_query);
+    }
 
-        /*
-        let sql = if cypher_query.to_uppercase().starts_with("MATCH") {
-            "SELECT * FROM nodes;".to_string()
-        } else {
-            format!("/* cypher: {} */\nSELECT 'untranslated' as placeholder;", cypher_query)
-        };
-        */
+    let cypher_query = args[1..].join(" ");
 
-        let tokens = tokenize(&cypher_query);
+    let tokens = tokenize(&cypher_query);
+    let token_refs: Vec<&MyToken> = tokens.iter().collect();
 
-        for token in &tokens {
-            //println!("{:?} => {:?}", token.tok, token.text);
-        }
+    let mut sql = String::new();
 
-        //println!("--- Accessing specific token by index ---");
-
-        let i = 2;
-        if let Some(token) = tokens.get(i) {
-            //println!("tokens[{}] = {:?} => {:?}", i, token.tok, token.text);
-        } else {
-            //println!("No token at index {}", i);
-        }
-
-         //feature 1 : MATCH to SQL translation
-        //parse into tokens of MATCH keyword, stuff in parentheses, etc.
-        //if colon after n? then add label = word 
-        //add : MATCH (a)-[:KNOWS]->(b) => SELECT * FROM nodes a JOIN edges e ON a.id = e.src_id JOIN nodes b ON e.dst_id = b.id WHERE e.type = 'KNOWS';
-        //MATCH (a)-[r:TYPE]-(b) => WHERE e.type = 'TYPE'
-        //MATCH (a)-[*2..4]->(b) => WHERE e.hops BETWEEN 2 AND 4
-        //etc.  
-
-        let tokens = tokenize(&cypher_query);
-
-        let mut sql = String::new();
-
-        // Get references to all tokens at the beginning
-        let token_refs: Vec<&MyToken> = tokens.iter().collect();
-
-        if token_refs.len() >= 4 {
-            if token_refs[0].text == "MATCH" && token_refs[1].tok == Token::LParen {
-                // Node with label case (needs 5 tokens)
-                if token_refs.len() >= 6
-                && token_refs[0].text.to_uppercase() == "MATCH"
-                && token_refs[1].tok == Token::LParen
-                && token_refs[3].tok == Token::RParen
-                && token_refs[4].text.to_uppercase() == "RETURN"
-                {
-                    sql = "SELECT * FROM nodes;".to_string();
-                }
-                else if token_refs.len() >= 5
+    if token_refs.len() >= 1 {
+        if token_refs.len() >= 4 && token_refs[0].text.to_uppercase() == "MATCH" {
+            if token_refs[1].tok == Token::LParen {
+                // MATCH (n:Label) RETURN ...
+                if token_refs.len() >= 8
                     && token_refs[3].tok == Token::Colon
-                    && token_refs[2].text == "n"
-                    && token_refs[4].tok == Token::RParen
+                    && token_refs[5].tok == Token::RParen
+                    && token_refs[6].text.to_uppercase() == "RETURN"
                 {
-                    sql = format!("SELECT * FROM nodes WHERE label = '{}';", token_refs[2].text);
+                    let name = &token_refs[4].text;
+                    sql = format!("SELECT * FROM nodes WHERE label = '{}';", name);
                 }
-                // Node without label case (exactly 4 tokens)
-                else if token_refs[3].tok == Token::RParen && token_refs[2].text == "n" && token_refs.len() == 4
+                // MATCH (n) RETURN
+                else if token_refs.len() >= 6
+                    && token_refs[3].tok == Token::RParen
+                    && token_refs[4].text.to_uppercase() == "RETURN"
                 {
                     sql = "SELECT * FROM nodes;".to_string();
                 }
             }
         }
 
-        //println!("Generated SQL: {}", sql);
+        else if token_refs[0].text.to_uppercase() == "RETURN" {
+            // RETURN 'value' AS name (string)
+            if token_refs.len() == 4
+                && token_refs[1].tok == Token::StringLiteral
+                && token_refs[2].text.to_uppercase() == "AS"
+                && token_refs[3].tok == Token::Ident
+            {
+                let value = &token_refs[1].text;
+                let alias = &token_refs[3].text;
+                sql = format!("SELECT {} AS {};", value, alias);
+            }
+            // RETURN number AS name
+            else if token_refs.len() == 4
+                && token_refs[1].tok == Token::Number
+                && token_refs[2].text.to_uppercase() == "AS"
+                && token_refs[3].tok == Token::Ident
+            {
+                let value = &token_refs[1].text;
+                let alias = &token_refs[3].text;
+                sql = format!("SELECT {} AS {};", value, alias);
+            }
+            // RETURN 'value' (no alias)
+            else if token_refs.len() == 2
+                && token_refs[1].tok == Token::StringLiteral
+            {
+                sql = format!("SELECT {};", token_refs[1].text);
+            }
+            // RETURN number (no alias)
+            else if token_refs.len() == 2
+                && token_refs[1].tok == Token::Number
+            {
+                sql = format!("SELECT {};", token_refs[1].text);
+            }
+        }
 
-
-
-
-
-
-        //NEXT : WHERE clause translation
-        //WHERE a.property = 'value' => WHERE a.property = 'value'
-        
-        //RETURN count(N) => SELECT COUNT(*)
-        //RETURN a, b => SELECT a.*, b.*
-
-        //CREATE (n:Person {name: "Bob"}) => INSERT INTO nodes (label, name) VALUES ('Person', 'Bob');
-
-        //DELETE n => DELETE FROM nodes WHERE id = n.id;
-
-        //DETACH DELETE n => DELETE FROM nodes WHERE id = n.id; DELETE FROM edges WHERE src_id = n.id OR dst_id = n.id;
-
-        println!("{}", sql);
+        else if token_refs[0].text.to_uppercase() == "CREATE" {
+            // CREATE (n:Label)
+            if token_refs.len() >= 6
+                && token_refs[1].tok == Token::LParen
+                && token_refs[3].tok == Token::Colon
+                && token_refs[5].tok == Token::RParen
+            {
+                let label = &token_refs[4].text;
+                sql = format!("INSERT INTO nodes (label, properties) VALUES ('{}', '{{}}'); SELECT * FROM nodes WHERE id = last_insert_rowid();", label);
+            } else if token_refs.len() >= 4
+                && token_refs[1].tok == Token::LParen
+                && token_refs[3].tok == Token::RParen
+            {
+                sql = "INSERT INTO nodes (label, properties) VALUES ('', '{}'); SELECT * FROM nodes WHERE id = last_insert_rowid();".to_string();
+            } else if token_refs.len() >= 11 
+                && token_refs[1].tok == Token::LParen
+                && token_refs[3].tok == Token::Colon
+                && token_refs[5].tok == Token::LBrace
+            {
+                let label = &token_refs[4].text;
+                
+                // Find the closing brace
+                let mut brace_end = 0;
+                for i in 6..token_refs.len() {
+                    if token_refs[i].tok == Token::RBrace {
+                        brace_end = i;
+                        if i + 1 >= token_refs.len() || token_refs[i+1].tok != Token::RParen {
+                            // Invalid syntax
+                            println!("");
+                            return;
+                        }
+                        break;
+                    }
+                }
+                
+                if brace_end == 0 {
+                    // No closing brace found
+                    println!("");
+                    return;
+                }
+                
+                // Parse properties between braces
+                let mut properties = std::collections::HashMap::new();
+                let mut i = 6;
+                
+                while i < brace_end {
+                    // Expect: key : value [, key : value ...]
+                    if i + 2 < brace_end 
+                        && token_refs[i].tok == Token::Ident 
+                        && token_refs[i+1].tok == Token::Colon
+                    {
+                        let key = &token_refs[i].text;
+                        let value = if token_refs[i+2].tok == Token::StringLiteral {
+                            // Remove quotes from string literal
+                            token_refs[i+2].text.trim_matches('\'').to_string()
+                        } else if token_refs[i+2].tok == Token::Number {
+                            token_refs[i+2].text.clone()
+                        } else {
+                            token_refs[i+2].text.clone()
+                        };
+                        
+                        properties.insert(key.clone(), value);
+                        i += 3; // Move past key : value
+                        
+                        // Skip comma if present
+                        if i < brace_end && token_refs[i].tok == Token::Comma {
+                            i += 1;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+                
+                // Convert properties to JSON string
+                let json_props = properties.iter()
+                    .map(|(k, v)| format!("\"{}\":\"{}\"", k, v))
+                    .collect::<Vec<String>>()
+                    .join(",");
+                
+                sql = format!(
+                    "INSERT INTO nodes (label, properties) VALUES ('{}', '{{{}}}'); SELECT * FROM nodes WHERE id = last_insert_rowid();",
+                    label, json_props
+                );
+            }
+        }
     }
-    
+
+    println!("{}", sql);
 }
