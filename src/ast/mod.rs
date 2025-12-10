@@ -4280,22 +4280,37 @@ pub enum Statement {
     Reset(ResetStatement),
     /// Cypher MATCH statement
     /// Example: MATCH (n:Label) RETURN n
-    CypherMatch {
-        pattern: String,
-        return_items: Option<String>,
+    CypherMatchNode {
+        node_name: String, 
+        label: Option<String>, 
+        properties: Option<Vec<(String, String)>>,
+        return_for_match: Option<Vec<String>>,
     },
-    
-    /// Cypher CREATE statement
-    /// Example: CREATE (n:Label {prop: 'value'})
-    CypherCreate {
-        pattern: String,
+    CypherMatchEdge {
+        from_node: String,
+        edge_name: String,
+        to_node: String,
+        rel_type: Option<String>,
+        return_for_match: Option<Vec<String>>,
     },
-    
-    /// Cypher RETURN statement
-    /// Example: RETURN 'value' AS name
-    CypherReturn {
-        expression: String,
-        alias: Option<String>,
+    CypherCreate{
+        node_name: String, 
+        label: Option<String>, 
+        properties: Option<Vec<(String, String)>>,
+    },
+    CypherReturn{
+        items: Vec<(String, Option<String>)>,
+    },
+    CypherDelete {
+        node_or_edge_name: String,  
+        is_edge: bool,              
+        detach: bool,               
+    },
+    CypherCreateRelationship{
+        from_node: String,
+        to_node: String,
+        rel_type: String,
+        properties: Option<Vec<(String, String)>>,
     },
 }
 
@@ -5796,22 +5811,88 @@ impl fmt::Display for Statement {
             Statement::Vacuum(s) => write!(f, "{s}"),
             Statement::AlterUser(s) => write!(f, "{s}"),
             Statement::Reset(s) => write!(f, "{s}"),
-            Statement::CypherMatch { pattern, return_items } => {
-                write!(f, "MATCH {}", pattern)?;
-                if let Some(return_items) = return_items {
-                    write!(f, " RETURN {}", return_items)?;
+            Statement::CypherMatchNode { node_name, label, properties, return_for_match } => {
+                // Convert to SQL SELECT
+                if let Some(props) = properties {
+                    // MATCH (n:Bug {name: 'Ant'}) -> WHERE with JSON query
+                    let where_clause = props.iter()
+                        .map(|(k, v)| format!("json_extract(properties, '$.{}') = '{}'", k, v))
+                        .collect::<Vec<_>>()
+                        .join(" AND ");
+                    
+                    if let Some(l) = label {
+                        write!(f, "SELECT * FROM nodes WHERE label = '{}' AND {}", l, where_clause)
+                    } else {
+                        write!(f, "SELECT * FROM nodes WHERE {}", where_clause)
+                    }
+                } else if let Some(l) = label {
+                    // MATCH (n:Bug) -> SELECT with label filter
+                    write!(f, "SELECT * FROM nodes WHERE label = '{}'", l)
+                } else {
+                    // MATCH (n) -> SELECT all
+                    write!(f, "SELECT * FROM nodes")
+                }
+            }
+
+            Statement::CypherMatchEdge { from_node, edge_name, to_node, rel_type, return_for_match } => {
+                // Convert to SQL JOIN
+                if let Some(rt) = rel_type {
+                    write!(f, "SELECT e.* FROM edges e WHERE e.type = '{}'", rt)
+                } else {
+                    write!(f, "SELECT * FROM edges")
+                }
+            }
+
+            Statement::CypherCreate { node_name, label, properties } => {
+                let default_label = "Node".to_string();
+                let label_str = label.as_ref().unwrap_or(&default_label);
+
+                
+                if let Some(props) = properties {
+                    let json_props = props.iter()
+                        .map(|(k, v)| format!("\"{}\":\"{}\"", k, v))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    
+                    write!(f, "INSERT INTO nodes (label, properties) VALUES ('{}', '{{{}}}'); SELECT * FROM nodes WHERE id = last_insert_rowid()", label_str, json_props)
+                } else {
+                    write!(f, "INSERT INTO nodes (label, properties) VALUES ('{}', '{{}}'); SELECT * FROM nodes WHERE id = last_insert_rowid()", label_str)
+                }
+            }
+
+            Statement::CypherReturn { items } => {
+                write!(f, "SELECT ")?;
+                for (i, (expr, alias)) in items.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{}", expr)?;
+                    if let Some(a) = alias {
+                        write!(f, " AS {}", a)?;
+                    }
                 }
                 Ok(())
             }
-            Statement::CypherCreate { pattern } => {
-                write!(f, "CREATE {}", pattern)
-            }
-            Statement::CypherReturn { expression, alias } => {
-                write!(f, "RETURN {}", expression)?;
-                if let Some(alias) = alias {
-                    write!(f, " AS {}", alias)?;
+
+            Statement::CypherDelete { node_or_edge_name, is_edge, detach } => {
+                if *is_edge {
+                    write!(f, "DELETE FROM edges WHERE id = ?")  // Will need variable binding
+                } else if *detach {
+                    write!(f, "DELETE FROM edges WHERE src_id = ? OR dst_id = ?; DELETE FROM nodes WHERE id = ?")
+                } else {
+                    write!(f, "DELETE FROM nodes WHERE id = ?")
                 }
-                Ok(())
+            }
+
+            Statement::CypherCreateRelationship { from_node, to_node, rel_type, properties } => {
+                if let Some(props) = properties {
+                    let json_props = props.iter()
+                        .map(|(k, v)| format!("\"{}\":\"{}\"", k, v))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    
+                    write!(f, "INSERT INTO edges (src_id, dst_id, type, properties) VALUES (?, ?, '{}', '{{{}}}')", rel_type, json_props)
+                } else {
+                    write!(f, "INSERT INTO edges (src_id, dst_id, type, properties) VALUES (?, ?, '{}', '{{}}')", rel_type)
+                }
             }
         }
     }

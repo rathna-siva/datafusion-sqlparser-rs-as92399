@@ -945,6 +945,8 @@ impl<'a> Tokenizer<'a> {
                 ' ' => self.consume_and_return(chars, Token::Whitespace(Whitespace::Space)),
                 '\t' => self.consume_and_return(chars, Token::Whitespace(Whitespace::Tab)),
                 '\n' => self.consume_and_return(chars, Token::Whitespace(Whitespace::Newline)),
+                '[' => self.consume_and_return(chars, Token::LBracket),
+                ']' => self.consume_and_return(chars, Token::RBracket),
                 '\r' => {
                     // Emit a single Whitespace::Newline token for \r and \r\n
                     chars.next();
@@ -1324,22 +1326,30 @@ impl<'a> Tokenizer<'a> {
 
                     match chars.peek() {
                         Some('-') => {
-                            let mut is_comment = true;
-                            if self.dialect.requires_single_line_comment_whitespace() {
-                                is_comment = Some(' ') == chars.peekable.clone().nth(1);
+                            // Peek next char
+                            let next = chars.peekable.clone().nth(1);
+
+                            // Only treat as comment if TWO hyphens '--'
+                            if next == Some('-') {
+                                // Optional SQLite rule
+                                let mut is_comment = true;
+                                if self.dialect.requires_single_line_comment_whitespace() {
+                                    is_comment = chars.peekable.clone().nth(2) == Some(' ');
+                                }
+
+                                if is_comment {
+                                    chars.next(); // consume second '-'
+                                    let comment = self.tokenize_single_line_comment(chars);
+                                    return Ok(Some(Token::Whitespace(
+                                        Whitespace::SingleLineComment {
+                                            prefix: "--".to_owned(),
+                                            comment,
+                                        },
+                                    )));
+                                }
                             }
 
-                            if is_comment {
-                                chars.next(); // consume second '-'
-                                let comment = self.tokenize_single_line_comment(chars);
-                                return Ok(Some(Token::Whitespace(
-                                    Whitespace::SingleLineComment {
-                                        prefix: "--".to_owned(),
-                                        comment,
-                                    },
-                                )));
-                            }
-
+                            // If not comment, just minus
                             self.start_binop(chars, "-", Token::Minus)
                         }
                         Some('>') => {
@@ -1526,8 +1536,6 @@ impl<'a> Tokenizer<'a> {
                 }
                 ';' => self.consume_and_return(chars, Token::SemiColon),
                 '\\' => self.consume_and_return(chars, Token::Backslash),
-                '[' => self.consume_and_return(chars, Token::LBracket),
-                ']' => self.consume_and_return(chars, Token::RBracket),
                 '&' => {
                     chars.next(); // consume the '&'
                     match chars.peek() {

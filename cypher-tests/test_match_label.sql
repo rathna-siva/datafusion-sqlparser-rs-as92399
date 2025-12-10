@@ -1,0 +1,1 @@
+MATCH (n:Bug) RETURN n

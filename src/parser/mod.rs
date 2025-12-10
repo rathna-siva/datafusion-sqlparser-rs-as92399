@@ -576,17 +576,51 @@ impl<'a> Parser<'a> {
                         self.parse_attach_database()
                     }
                 }
-                Keyword::DETACH if dialect_of!(self is DuckDbDialect | GenericDialect) => {
-                    self.parse_detach_duckdb_database()
+                Keyword::DETACH => {
+                    // Check if next token is DELETE (Cypher) or DATABASE (DuckDB SQL)
+                    if self.peek_token().token == Token::Word(Word {
+                        value: "DELETE".to_string(),
+                        keyword: Keyword::DELETE,
+                        quote_style: None,
+                    }) {
+                        // Cypher DETACH DELETE
+                        self.prev_token();
+                        self.parse_cypher_delete()
+                    } else if dialect_of!(self is DuckDbDialect | GenericDialect) {
+                        self.parse_detach_duckdb_database()
+                    } else {
+                        self.expected("DELETE or DATABASE after DETACH", self.peek_token())
+                    }
                 }
                 Keyword::MSCK => self.parse_msck(),
-                Keyword::CREATE => self.parse_create(),
+                Keyword::CREATE => {
+                    self.prev_token();
+                    self.parse_create()
+                }
                 Keyword::CACHE => self.parse_cache_table(),
                 Keyword::DROP => self.parse_drop(),
                 Keyword::DISCARD => self.parse_discard(),
                 Keyword::DECLARE => self.parse_declare(),
                 Keyword::FETCH => self.parse_fetch_statement(),
-                Keyword::DELETE => self.parse_delete(next_token),
+                Keyword::DELETE => {
+                    // Check if it's preceded by MATCH (Cypher) or standalone DELETE (SQL)
+                    // For now, peek ahead to detect pattern
+                    let checkpoint = self.index;
+                    
+                    // Try Cypher DELETE
+                    let var_result = self.parse_identifier();
+                    
+                    if var_result.is_ok() && matches!(self.peek_token().token, Token::EOF | Token::SemiColon) {
+                        // Looks like Cypher: DELETE n
+                        self.index = checkpoint;
+                        self.prev_token();
+                        self.parse_cypher_delete()
+                    } else {
+                        // SQL DELETE
+                        self.index = checkpoint;
+                        self.parse_delete(next_token)
+                    }
+                }
                 Keyword::INSERT => self.parse_insert(next_token),
                 Keyword::REPLACE => self.parse_replace(next_token),
                 Keyword::UNCACHE => self.parse_uncache_table(),
@@ -4729,18 +4763,132 @@ impl<'a> Parser<'a> {
     /// Parse a SQL CREATE statement
     pub fn parse_create(&mut self) -> Result<Statement, ParserError> {
         // Check if it's Cypher CREATE (starts with parenthesis for node pattern)
+        self.expect_keyword(Keyword::CREATE)?;
+
         if self.peek_token().token == Token::LParen {
-            // Cypher CREATE - collect the entire pattern
-            let mut pattern_tokens = Vec::new();
+            self.next_token(); // consume (
             
-            while self.peek_token().token != Token::EOF 
-                && self.peek_token().token != Token::SemiColon 
-            {
-                pattern_tokens.push(self.next_token().to_string());
+            let node_name = self.parse_identifier()?.to_string();
+            
+            // --- FIXED CYPER PATTERN PARSING START ---
+
+            // Check what comes next: ')' (Simple node/Relationship) or ':'/ '{' (Node with details)
+            if self.consume_token(&Token::RParen) { 
+                // Case 1: We consumed ')' -> Pattern is (a)
+                
+                // Check if followed by relationship: (a)-...
+                // Check if followed by relationship: (a)-...
+                if self.peek_token().token == Token::Minus {
+                    self.next_token(); // consume -
+                    
+                    // --- Relationship parsing starts here ---
+                    // --- DEBUG POINT ADDED HERE ---
+                    let next_token = self.peek_token();
+
+                    // We must see the LBracket token here.
+                    if next_token.token != Token::LBracket {
+                        // If it's not LBracket, we construct a detailed error message
+                        // that includes the actual token found.
+                        let found_token_str = format!("{:?}", next_token.token);
+                        
+                        // Using self.expected to return the error immediately, 
+                        // reporting exactly what was found.
+                        return self.expected(
+                            &format!("relationship type bracket ["), // Expected part
+                            next_token
+                        );
+                    }
+
+                    // If the check passes, consume the token and proceed.
+                    self.next_token(); // Consume [
+                    
+                    // The rest of the parsing, assuming tokens are separated:
+                    self.expect_token(&Token::Colon)?;
+                    let rel_type = self.parse_identifier()?.to_string();
+                    
+                    // Properties (optional)
+                    let properties = if self.consume_token(&Token::LBrace) {
+                        // Property placeholder fix (consumes tokens inside braces):
+                        while !matches!(self.peek_token().token, Token::RBrace) {
+                            self.next_token(); 
+                        }
+                        self.expect_token(&Token::RBrace)?;
+                        None  // placeholder return
+                    } else {
+                        None
+                    };
+                    
+                    self.expect_token(&Token::RBracket)?;
+                    self.expect_token(&Token::Arrow)?;
+                    self.expect_token(&Token::LParen)?;
+                    
+                    let to_node = self.parse_identifier()?.to_string();
+                    self.expect_token(&Token::RParen)?;
+                    
+                    return Ok(Statement::CypherCreateRelationship {
+                        from_node: node_name,
+                        to_node,
+                        rel_type,
+                        properties,
+                    });
+                }
+                
+                // If we get here, it was just (a), so return the simple node creation.
+                return Ok(Statement::CypherCreate {
+                    node_name,
+                    label: None,
+                    properties: None,
+                });
+            }       
+            
+            // Case 2: Didn't consume ')' -> Must be Node creation with label/properties (a:Label)
+            
+            // If the next token is NOT ':' and NOT '{', it's an error.
+            if self.peek_token().token != Token::Colon && self.peek_token().token != Token::LBrace {
+                 return self.expected("closing parenthesis, label, or properties", self.peek_token());
             }
+
+            // Node creation: (n:Label {props})
+            self.expect_token(&Token::Colon)?;
+            let label = self.parse_identifier()?.to_string();
+            
+            let properties = if self.consume_token(&Token::LBrace) {
+                let mut props = Vec::new(); // Type inference is OK here because of later use
+                
+                while !matches!(self.peek_token().token, Token::RBrace) {
+                    let key = self.parse_identifier()?.to_string();
+                    self.expect_token(&Token::Colon)?;
+                    
+                    let value = match &self.peek_token().token {
+                        Token::SingleQuotedString(s) => {
+                            let v = s.clone();
+                            self.next_token();
+                            v
+                        }
+                        Token::Number(n, _) => {
+                            let v = n.clone();
+                            self.next_token();
+                            v
+                        }
+                        _ => return self.expected("property value", self.peek_token()),
+                    };
+                    
+                    props.push((key, value));
+                    self.consume_token(&Token::Comma);
+                }
+                
+                self.expect_token(&Token::RBrace)?;
+                Some(props)
+            } else {
+                None
+            };
+            
+            self.expect_token(&Token::RParen)?;
             
             return Ok(Statement::CypherCreate {
-                pattern: pattern_tokens.join(" "),
+                node_name,
+                label: Some(label),
+                properties,
             });
         }
         let or_replace = self.parse_keywords(&[Keyword::OR, Keyword::REPLACE]);
@@ -17794,72 +17942,190 @@ impl<'a> Parser<'a> {
 
     fn parse_cypher_return(&mut self) -> Result<Statement, ParserError> {
         self.expect_keyword(Keyword::RETURN)?;
-        let mut return_tokens = Vec::new();
         
-        while self.peek_token().token != Token::EOF
-            && self.peek_token().token != Token::SemiColon
-        {
-            if let Token::Word(w) = &self.peek_token().token {
-                if w.keyword == Keyword::AS {
-                    break;
+        let mut items = Vec::new();
+        
+        loop {
+            let mut expr_tokens = Vec::new();
+            
+            while self.peek_token().token != Token::EOF 
+                && self.peek_token().token != Token::SemiColon
+                && self.peek_token().token != Token::Comma
+            {
+                if let Token::Word(w) = &self.peek_token().token {
+                    if w.keyword == Keyword::AS {
+                        break;
+                    }
                 }
+                expr_tokens.push(self.next_token().to_string());
             }
-            return_tokens.push(self.next_token().to_string());
+            
+            let expression = expr_tokens.join(" ");
+            
+            let alias = if self.parse_keyword(Keyword::AS) {
+                Some(self.parse_identifier()?.to_string())
+            } else {
+                None
+            };
+            
+            items.push((expression, alias));
+            
+            if !self.consume_token(&Token::Comma) {
+                break;
+            }
         }
         
-        let mut alias = None;
-        if self.parse_keyword(Keyword::AS) {
-            alias = Some(self.parse_identifier()?.to_string());
-        }
-        
-        Ok(Statement::CypherReturn {
-            expression: return_tokens.join(" "),
-            alias,
-        })
+        Ok(Statement::CypherReturn { items })
     }
 
     fn parse_cypher_match(&mut self) -> Result<Statement, ParserError> {
         self.expect_keyword(Keyword::MATCH)?;
-        let mut match_tokens = Vec::new();
-        let mut open_lparen = 0;
-        let mut open_rparen = 0;
+        self.expect_token(&Token::LParen)?;
         
-        while self.peek_token().token != Token::EOF {
-            let cur_tok = self.peek_token().token.clone();
-            
-            if cur_tok == Token::LParen {
-                open_lparen += 1;
-            } else if cur_tok == Token::RParen {
-                open_rparen += 1;
-            }
-
-            if open_lparen == open_rparen {
-                if let Token::Word(w) = &cur_tok {
-                    if w.keyword == Keyword::RETURN {
-                        break;
+        // Check if it's an edge pattern: (a)-[r]->(b)
+        let first_var = self.parse_identifier()?.to_string();
+        
+        if self.consume_token(&Token::RParen) {
+            // Check for edge pattern: )-[
+            if self.consume_token(&Token::Minus) && self.consume_token(&Token::LBracket) {
+                // Edge pattern: (a)-[r]->(b)
+                let edge_name = self.parse_identifier()?.to_string();
+                
+                // Check for relationship type
+                let rel_type = if self.consume_token(&Token::Colon) {
+                    Some(self.parse_identifier()?.to_string())
+                } else {
+                    None
+                };
+                
+                self.expect_token(&Token::RBracket)?;
+                self.expect_token(&Token::Arrow)?;
+                self.expect_token(&Token::LParen)?;
+                
+                let to_node = self.parse_identifier()?.to_string();
+                self.expect_token(&Token::RParen)?;
+                
+                // Parse RETURN if present
+                let return_for_match = if self.parse_keyword(Keyword::RETURN) {
+                    let mut items = Vec::new();
+                    loop {
+                        items.push(self.parse_identifier()?.to_string());
+                        if !self.consume_token(&Token::Comma) {
+                            break;
+                        }
                     }
-                }
+                    Some(items)
+                } else {
+                    None
+                };
+                
+                return Ok(Statement::CypherMatchEdge {
+                    from_node: first_var,
+                    edge_name,
+                    to_node,
+                    rel_type,
+                    return_for_match,
+                });
+            } else {
+                // Simple node pattern without label: (n)
+                let return_for_match = if self.parse_keyword(Keyword::RETURN) {
+                    let mut items = Vec::new();
+                    loop {
+                        items.push(self.parse_identifier()?.to_string());
+                        if !self.consume_token(&Token::Comma) {
+                            break;
+                        }
+                    }
+                    Some(items)
+                } else {
+                    None
+                };
+                
+                return Ok(Statement::CypherMatchNode {
+                    node_name: first_var,
+                    label: None,
+                    properties: None,
+                    return_for_match,
+                });
             }
-            match_tokens.push(self.next_token().to_string());
         }
         
-        let return_items = if self.parse_keyword(Keyword::RETURN) {
-            let mut return_tokens = Vec::new();
-            
-            while self.peek_token().token != Token::EOF 
-                && self.peek_token().token != Token::SemiColon 
-            {
-                return_tokens.push(self.next_token().to_string());
-            }
-            
-            Some(return_tokens.join(" "))
+        // Node pattern with label: (n:Label) or properties
+        let label = if self.consume_token(&Token::Colon) {
+            Some(self.parse_identifier()?.to_string())
         } else {
             None
         };
         
-        Ok(Statement::CypherMatch {
-            pattern: match_tokens.join(" "),
-            return_items,
+        // Parse properties if present
+        let properties = if self.consume_token(&Token::LBrace) {
+            let mut props = Vec::new();
+            
+            while !matches!(self.peek_token().token, Token::RBrace) {
+                let key = self.parse_identifier()?.to_string();
+                self.expect_token(&Token::Colon)?;
+                
+                let value = match &self.peek_token().token {
+                    Token::SingleQuotedString(s) => {
+                        let v = s.clone();
+                        self.next_token();
+                        v
+                    }
+                    Token::Number(n, _) => {
+                        let v = n.clone();
+                        self.next_token();
+                        v
+                    }
+                    _ => return self.expected("property value", self.peek_token()),
+                };
+                
+                props.push((key, value));
+                self.consume_token(&Token::Comma);
+            }
+            
+            self.expect_token(&Token::RBrace)?;
+            Some(props)
+        } else {
+            None
+        };
+        
+        self.expect_token(&Token::RParen)?;
+        
+        // Parse RETURN if present
+        let return_for_match = if self.parse_keyword(Keyword::RETURN) {
+            let mut items = Vec::new();
+            loop {
+                let item_str = self.parse_identifier()?.to_string();
+                items.push(item_str);
+                if !self.consume_token(&Token::Comma) {
+                    break;
+                }
+            }
+            Some(items)
+        } else {
+            None
+        };
+        
+        Ok(Statement::CypherMatchNode {
+            node_name: first_var,
+            label,
+            properties,
+            return_for_match,
+        })
+    }
+
+    fn parse_cypher_delete(&mut self) -> Result<Statement, ParserError> {
+        let detach = self.parse_keyword(Keyword::DETACH);
+        self.expect_keyword(Keyword::DELETE)?;
+        
+        let node_or_edge_name = self.parse_identifier()?.to_string();
+        
+        // For now, assume it's a node (is_edge = false)
+        // In a real implementation, you'd track this from MATCH
+        Ok(Statement::CypherDelete {
+            node_or_edge_name,
+            is_edge: false,  // TODO: detect from context
+            detach,
         })
     }
 

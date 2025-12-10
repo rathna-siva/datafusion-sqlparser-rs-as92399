@@ -1,0 +1,1 @@
+CREATE (a)-[:EATS]->(b)
