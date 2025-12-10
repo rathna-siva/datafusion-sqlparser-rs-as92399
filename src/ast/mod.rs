@@ -4278,6 +4278,25 @@ pub enum Statement {
     /// ```
     /// [PostgreSQL](https://www.postgresql.org/docs/current/sql-reset.html)
     Reset(ResetStatement),
+    /// Cypher MATCH statement
+    /// Example: MATCH (n:Label) RETURN n
+    CypherMatch {
+        pattern: String,
+        return_items: Option<String>,
+    },
+    
+    /// Cypher CREATE statement
+    /// Example: CREATE (n:Label {prop: 'value'})
+    CypherCreate {
+        pattern: String,
+    },
+    
+    /// Cypher RETURN statement
+    /// Example: RETURN 'value' AS name
+    CypherReturn {
+        expression: String,
+        alias: Option<String>,
+    },
 }
 
 impl From<Analyze> for Statement {
@@ -5777,6 +5796,23 @@ impl fmt::Display for Statement {
             Statement::Vacuum(s) => write!(f, "{s}"),
             Statement::AlterUser(s) => write!(f, "{s}"),
             Statement::Reset(s) => write!(f, "{s}"),
+            Statement::CypherMatch { pattern, return_items } => {
+                write!(f, "MATCH {}", pattern)?;
+                if let Some(return_items) = return_items {
+                    write!(f, " RETURN {}", return_items)?;
+                }
+                Ok(())
+            }
+            Statement::CypherCreate { pattern } => {
+                write!(f, "CREATE {}", pattern)
+            }
+            Statement::CypherReturn { expression, alias } => {
+                write!(f, "RETURN {}", expression)?;
+                if let Some(alias) = alias {
+                    write!(f, " AS {}", alias)?;
+                }
+                Ok(())
+            }
         }
     }
 }

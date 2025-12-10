@@ -647,7 +647,14 @@ impl<'a> Parser<'a> {
                 // `COMMENT` is snowflake specific https://docs.snowflake.com/en/sql-reference/sql/comment
                 Keyword::COMMENT if self.dialect.supports_comment_on() => self.parse_comment(),
                 Keyword::PRINT => self.parse_print(),
-                Keyword::RETURN => self.parse_return(),
+                Keyword::RETURN => {
+                    self.prev_token();
+                    self.parse_return()
+                }
+                Keyword::MATCH => {
+                    self.prev_token();
+                    self.parse_cypher_match()
+                }
                 Keyword::EXPORT => {
                     self.prev_token();
                     self.parse_export_data()
@@ -4721,6 +4728,21 @@ impl<'a> Parser<'a> {
 
     /// Parse a SQL CREATE statement
     pub fn parse_create(&mut self) -> Result<Statement, ParserError> {
+        // Check if it's Cypher CREATE (starts with parenthesis for node pattern)
+        if self.peek_token().token == Token::LParen {
+            // Cypher CREATE - collect the entire pattern
+            let mut pattern_tokens = Vec::new();
+            
+            while self.peek_token().token != Token::EOF 
+                && self.peek_token().token != Token::SemiColon 
+            {
+                pattern_tokens.push(self.next_token().to_string());
+            }
+            
+            return Ok(Statement::CypherCreate {
+                pattern: pattern_tokens.join(" "),
+            });
+        }
         let or_replace = self.parse_keywords(&[Keyword::OR, Keyword::REPLACE]);
         let or_alter = self.parse_keywords(&[Keyword::OR, Keyword::ALTER]);
         let local = self.parse_one_of_keywords(&[Keyword::LOCAL]).is_some();
@@ -17746,6 +17768,22 @@ impl<'a> Parser<'a> {
 
     /// Parse [Statement::Return]
     fn parse_return(&mut self) -> Result<Statement, ParserError> {
+        let checkpoint = self.index;
+        self.expect_keyword(Keyword::RETURN)?;
+        
+        let cur_tok = &self.peek_token().token;
+        let is_cypher = matches!(cur_tok, 
+            Token::SingleQuotedString(_) | 
+            Token::Number(_, _) |
+            Token::Word(_)
+        );
+        
+        if is_cypher {
+            // Reset and parse as Cypher
+            self.index = checkpoint;
+            return self.parse_cypher_return();
+        }
+
         match self.maybe_parse(|p| p.parse_expr())? {
             Some(expr) => Ok(Statement::Return(ReturnStatement {
                 value: Some(ReturnStatementValue::Expr(expr)),
@@ -17753,6 +17791,78 @@ impl<'a> Parser<'a> {
             None => Ok(Statement::Return(ReturnStatement { value: None })),
         }
     }
+
+    fn parse_cypher_return(&mut self) -> Result<Statement, ParserError> {
+        self.expect_keyword(Keyword::RETURN)?;
+        let mut return_tokens = Vec::new();
+        
+        while self.peek_token().token != Token::EOF
+            && self.peek_token().token != Token::SemiColon
+        {
+            if let Token::Word(w) = &self.peek_token().token {
+                if w.keyword == Keyword::AS {
+                    break;
+                }
+            }
+            return_tokens.push(self.next_token().to_string());
+        }
+        
+        let mut alias = None;
+        if self.parse_keyword(Keyword::AS) {
+            alias = Some(self.parse_identifier()?.to_string());
+        }
+        
+        Ok(Statement::CypherReturn {
+            expression: return_tokens.join(" "),
+            alias,
+        })
+    }
+
+    fn parse_cypher_match(&mut self) -> Result<Statement, ParserError> {
+        self.expect_keyword(Keyword::MATCH)?;
+        let mut match_tokens = Vec::new();
+        let mut open_lparen = 0;
+        let mut open_rparen = 0;
+        
+        while self.peek_token().token != Token::EOF {
+            let cur_tok = self.peek_token().token.clone();
+            
+            if cur_tok == Token::LParen {
+                open_lparen += 1;
+            } else if cur_tok == Token::RParen {
+                open_rparen += 1;
+            }
+
+            if open_lparen == open_rparen {
+                if let Token::Word(w) = &cur_tok {
+                    if w.keyword == Keyword::RETURN {
+                        break;
+                    }
+                }
+            }
+            match_tokens.push(self.next_token().to_string());
+        }
+        
+        let return_items = if self.parse_keyword(Keyword::RETURN) {
+            let mut return_tokens = Vec::new();
+            
+            while self.peek_token().token != Token::EOF 
+                && self.peek_token().token != Token::SemiColon 
+            {
+                return_tokens.push(self.next_token().to_string());
+            }
+            
+            Some(return_tokens.join(" "))
+        } else {
+            None
+        };
+        
+        Ok(Statement::CypherMatch {
+            pattern: match_tokens.join(" "),
+            return_items,
+        })
+    }
+
 
     /// /// Parse a `EXPORT DATA` statement.
     ///

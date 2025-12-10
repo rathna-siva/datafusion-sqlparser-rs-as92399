@@ -477,6 +477,9 @@ impl Spanned for Statement {
             Statement::Vacuum(..) => Span::empty(),
             Statement::AlterUser(..) => Span::empty(),
             Statement::Reset(..) => Span::empty(),
+            Statement::CypherMatch { .. } => Span::empty(),
+            Statement::CypherCreate { .. } => Span::empty(),
+            Statement::CypherReturn { .. } => Span::empty(),
         }
     }
 }
