@@ -452,7 +452,7 @@ impl<'a> Parser<'a> {
     ///
     /// See example on [`Parser::new()`] for an example
     pub fn try_with_sql(self, sql: &str) -> Result<Self, ParserError> {
-        debug!("Parsing sql '{sql}'...");
+        //debug!("Parsing sql '{sql}'...");
         let tokens = Tokenizer::new(self.dialect, sql)
             .with_unescape(self.options.unescape)
             .tokenize_with_location()?;
@@ -4830,6 +4830,10 @@ impl<'a> Parser<'a> {
                         to_node,
                         rel_type,
                         properties,
+                        from_label: None,
+                        from_properties: None,
+                        to_label: None,
+                        to_properties: None,
                     });
                 }
                 
@@ -18027,6 +18031,20 @@ impl<'a> Parser<'a> {
                     return_for_match,
                 });
             } else {
+                // Check for DETACH DELETE after simple node pattern
+                if self.peek_keyword(Keyword::DETACH) || self.peek_keyword(Keyword::DELETE) {
+                    let detach = self.parse_keyword(Keyword::DETACH);
+                    self.expect_keyword(Keyword::DELETE)?;
+                    let _delete_var = self.parse_identifier()?.to_string();
+                    return Ok(Statement::CypherDelete {
+                        node_or_edge_name: first_var,
+                        is_edge: false,
+                        detach,
+                        label: None,
+                        properties: None,
+                    });
+                }
+                
                 // Simple node pattern without label: (n)
                 let return_for_match = if self.parse_keyword(Keyword::RETURN) {
                     let mut items = Vec::new();
@@ -18091,6 +18109,121 @@ impl<'a> Parser<'a> {
         
         self.expect_token(&Token::RParen)?;
         
+        // Check for DETACH DELETE after full node pattern
+        if self.peek_keyword(Keyword::DETACH) || self.peek_keyword(Keyword::DELETE) {
+            let detach = self.parse_keyword(Keyword::DETACH);
+            self.expect_keyword(Keyword::DELETE)?;
+            let _delete_var = self.parse_identifier()?.to_string();
+            return Ok(Statement::CypherDelete {
+                node_or_edge_name: first_var,
+                is_edge: false,
+                detach,
+                label,
+                properties,
+            });
+        }
+        
+        // Check if there's another node pattern after a comma for relationship creation
+        if self.consume_token(&Token::Comma) {
+            // Parse second node pattern
+            self.expect_token(&Token::LParen)?;
+            let second_var = self.parse_identifier()?.to_string();
+            
+            let second_label = if self.consume_token(&Token::Colon) {
+                Some(self.parse_identifier()?.to_string())
+            } else {
+                None
+            };
+            
+            let second_properties = if self.consume_token(&Token::LBrace) {
+                let mut props = Vec::new();
+                while !matches!(self.peek_token().token, Token::RBrace) {
+                    let key = self.parse_identifier()?.to_string();
+                    self.expect_token(&Token::Colon)?;
+                    let value = match &self.peek_token().token {
+                        Token::SingleQuotedString(s) => {
+                            let v = s.clone();
+                            self.next_token();
+                            v
+                        }
+                        Token::Number(n, _) => {
+                            let v = n.clone();
+                            self.next_token();
+                            v
+                        }
+                        _ => return self.expected("property value", self.peek_token()),
+                    };
+                    props.push((key, value));
+                    self.consume_token(&Token::Comma);
+                }
+                self.expect_token(&Token::RBrace)?;
+                Some(props)
+            } else {
+                None
+            };
+            
+            self.expect_token(&Token::RParen)?;
+            
+            // Now check for CREATE relationship: CREATE (first)-[:TYPE]->(second);
+            if self.parse_keyword(Keyword::CREATE) {
+                self.expect_token(&Token::LParen)?;
+                let from_node = self.parse_identifier()?.to_string();
+                self.expect_token(&Token::RParen)?;
+                self.expect_token(&Token::Minus)?;
+                self.expect_token(&Token::LBracket)?;
+                
+                let rel_type = if self.consume_token(&Token::Colon) {
+                    self.parse_identifier()?.to_string()
+                } else {
+                    return self.expected("relationship type", self.peek_token());
+                };
+                
+                let rel_properties = if self.consume_token(&Token::LBrace) {
+                    let mut props = Vec::new();
+                    while !matches!(self.peek_token().token, Token::RBrace) {
+                        let key = self.parse_identifier()?.to_string();
+                        self.expect_token(&Token::Colon)?;
+                        let value = match &self.peek_token().token {
+                            Token::SingleQuotedString(s) => {
+                                let v = s.clone();
+                                self.next_token();
+                                v
+                            }
+                            Token::Number(n, _) => {
+                                let v = n.clone();
+                                self.next_token();
+                                v
+                            }
+                            _ => return self.expected("property value", self.peek_token()),
+                        };
+                        props.push((key, value));
+                        self.consume_token(&Token::Comma);
+                    }
+                    self.expect_token(&Token::RBrace)?;
+                    Some(props)
+                } else {
+                    None
+                };
+                
+                self.expect_token(&Token::RBracket)?;
+                self.expect_token(&Token::Arrow)?;
+                self.expect_token(&Token::LParen)?;
+                let to_node = self.parse_identifier()?.to_string();
+                self.expect_token(&Token::RParen)?;
+                
+                return Ok(Statement::CypherCreateRelationship {
+                    from_node,
+                    from_label: label,
+                    from_properties: properties,
+                    to_node,
+                    to_label: second_label,
+                    to_properties: second_properties,
+                    rel_type,
+                    properties: rel_properties,
+                });
+            }
+        }
+        
         // Parse RETURN if present
         let return_for_match = if self.parse_keyword(Keyword::RETURN) {
             let mut items = Vec::new();
@@ -18126,6 +18259,8 @@ impl<'a> Parser<'a> {
             node_or_edge_name,
             is_edge: false,  // TODO: detect from context
             detach,
+            label: None,
+            properties: None,
         })
     }
 

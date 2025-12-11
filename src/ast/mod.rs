@@ -4304,14 +4304,716 @@ pub enum Statement {
     CypherDelete {
         node_or_edge_name: String,  
         is_edge: bool,              
-        detach: bool,               
+        detach: bool,
+        label: Option<String>,
+        properties: Option<Vec<(String, String)>>,
     },
     CypherCreateRelationship{
         from_node: String,
+        from_label: Option<String>,
+        from_properties: Option<Vec<(String, String)>>,
         to_node: String,
+        to_label: Option<String>,
+        to_properties: Option<Vec<(String, String)>>,
         rel_type: String,
         properties: Option<Vec<(String, String)>>,
     },
+}
+
+fn handle_match_node(s: &Statement) -> Statement {
+    match s {
+        Statement::CypherMatchNode {
+            node_name: _,
+            label,
+            properties,
+            return_for_match: _,
+        } => {
+            let select_token = AttachedToken::empty();
+            let projection = vec![
+                SelectItem::Wildcard(
+                    WildcardAdditionalOptions::default()
+                ),
+            ];
+            let table = TableFactor::Table {
+                name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("nodes"))]),
+                alias: None,
+                args: None,
+                with_hints: vec![],
+                version: None,
+                with_ordinality: false,
+                partitions: vec![],
+                json_path: None,
+                sample: None,
+                index_hints: vec![],
+            };
+            let table_with_joins = TableWithJoins {
+                relation: table,
+                joins: vec![],
+            };
+            let from = vec![table_with_joins];
+            
+            // Build WHERE clause
+            // Start with label condition if present
+            let mut conditions = Vec::new();
+            
+            if let Some(lbl) = label {
+                conditions.push(Expr::BinaryOp {
+                    left: Box::new(Expr::Identifier(Ident::new("label"))),
+                    op: BinaryOperator::Eq,
+                    right: Box::new(Expr::Value(
+                        Value::SingleQuotedString(lbl.clone()).into()
+                    )),
+                });
+            }
+            
+            // Add property conditions if present
+            // MATCH (n:Bug {name: 'Ant'}) becomes:
+            // WHERE label = 'Bug' AND json_extract(properties, '$.name') = 'Ant'
+            if let Some(props) = properties {
+                for (prop_name, prop_value) in props {
+                    let json_path = format!("$.{}", prop_name);
+                    let json_extract = Expr::Function(Function {
+                        name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("json_extract"))]),
+                        uses_odbc_syntax: false,
+                        parameters: FunctionArguments::None,
+                        args: FunctionArguments::List(FunctionArgumentList {
+                            duplicate_treatment: None,
+                            args: vec![
+                                FunctionArg::Unnamed(FunctionArgExpr::Expr(
+                                    Expr::Identifier(Ident::new("properties"))
+                                )),
+                                FunctionArg::Unnamed(FunctionArgExpr::Expr(
+                                    Expr::Value(Value::SingleQuotedString(json_path).into())
+                                )),
+                            ],
+                            clauses: vec![],
+                        }),
+                        filter: None,
+                        null_treatment: None,
+                        over: None,
+                        within_group: vec![],
+                    });
+                    
+                    conditions.push(Expr::BinaryOp {
+                        left: Box::new(json_extract),
+                        op: BinaryOperator::Eq,
+                        right: Box::new(Expr::Value(
+                            Value::SingleQuotedString(prop_value.clone()).into()
+                        )),
+                    });
+                }
+            }
+            
+            // Combine all conditions with AND
+            let selection = if conditions.is_empty() {
+                None
+            } else if conditions.len() == 1 {
+                Some(conditions.pop().unwrap())
+            } else {
+                // Build nested AND expressions
+                let mut expr = conditions.remove(0);
+                for cond in conditions {
+                    expr = Expr::BinaryOp {
+                        left: Box::new(expr),
+                        op: BinaryOperator::And,
+                        right: Box::new(cond),
+                    };
+                }
+                Some(expr)
+            };
+            
+            let select = Select {
+                select_token,
+                distinct: None,
+                top: None,
+                top_before_distinct: false,
+                projection,
+                exclude: None,
+                into: None,
+                from,
+                lateral_views: vec![],
+                prewhere: None,
+                selection,
+                group_by: GroupByExpr::Expressions(vec![], vec![]),
+                cluster_by: vec![],
+                distribute_by: vec![],
+                sort_by: vec![],
+                having: None,
+                named_window: vec![],
+                qualify: None,
+                window_before_qualify: false,
+                value_table_mode: None,
+                connect_by: None,
+                flavor: SelectFlavor::Standard,
+            };
+            let set_expr = SetExpr::Select(Box::new(select));
+            let query = Query {
+                with: None,
+                body: Box::new(set_expr),
+                order_by: None,
+                limit_clause: None,
+                fetch: None,
+                locks: vec![],
+                for_clause: None,
+                settings: None,
+                format_clause: None,
+                pipe_operators: vec![],
+            };
+            Statement::Query(Box::new(query))
+        }
+        _ => s.clone()
+    }
+}
+
+fn handle_create_node(s: &Statement) -> Statement {
+    match s {
+        Statement::CypherCreate {
+            node_name: _,
+            label,
+            properties,
+        } => {
+            // Build columns and corresponding values
+            let mut columns: Vec<Ident> = Vec::new();
+            let mut row: Vec<Expr> = Vec::new();
+
+            if let Some(lbl) = label {
+                columns.push(Ident::new("label"));
+                row.push(Expr::Value(Value::SingleQuotedString(lbl.clone()).into()));
+            }
+
+            if let Some(props) = properties {
+                // Convert properties Vec<(String,String)> into a JSON object string
+                let mut pairs: Vec<String> = Vec::new();
+                for (k, v) in props {
+                    // minimal escaping for double quotes and backslashes
+                    let key = k.replace('"', "\\\"").replace('\\', "\\\\");
+                    let val = v.replace('"', "\\\"").replace('\\', "\\\\");
+                    pairs.push(format!("\"{}\":\"{}\"", key, val));
+                }
+                let json = format!("{{{}}}", pairs.join(","));
+                columns.push(Ident::new("properties"));
+                row.push(Expr::Value(Value::SingleQuotedString(json).into()));
+            }
+
+            // Build VALUES rows
+            let rows = if row.is_empty() {
+                vec![vec![]]
+            } else {
+                vec![row]
+            };
+
+            let values = SetExpr::Values(Values {
+                explicit_row: false,
+                value_keyword: false,
+                rows,
+            });
+
+            let query = Query {
+                with: None,
+                body: Box::new(values),
+                order_by: None,
+                limit_clause: None,
+                fetch: None,
+                locks: vec![],
+                for_clause: None,
+                settings: None,
+                format_clause: None,
+                pipe_operators: vec![],
+            };
+
+            let insert = Insert {
+                insert_token: AttachedToken::empty(),
+                or: None,
+                ignore: false,
+                into: true,
+                table: TableObject::TableName(ObjectName(vec![ObjectNamePart::Identifier(Ident::new("nodes"))])),
+                table_alias: None,
+                columns,
+                overwrite: false,
+                source: Some(Box::new(query)),
+                assignments: vec![],
+                partitioned: None,
+                after_columns: vec![],
+                has_table_keyword: false,
+                on: None,
+                returning: None,
+                replace_into: false,
+                priority: None,
+                insert_alias: None,
+                settings: None,
+                format_clause: None,
+            };
+
+            Statement::Insert(insert)
+        }
+        _ => s.clone(),
+    }
+}
+
+fn handle_delete_node(s: &Statement) -> Statement {
+    match s {
+        Statement::CypherDelete {
+            node_or_edge_name: _,
+            is_edge,
+            detach: _,
+            label,
+            properties,
+        } => {
+            let table_name = if *is_edge {
+                "edges".to_string()
+            } else {
+                "nodes".to_string()
+            };
+            
+            // Build WHERE clause similar to handle_match_node
+            let mut conditions = Vec::new();
+            
+            if let Some(lbl) = label {
+                conditions.push(Expr::BinaryOp {
+                    left: Box::new(Expr::Identifier(Ident::new("label"))),
+                    op: BinaryOperator::Eq,
+                    right: Box::new(Expr::Value(
+                        Value::SingleQuotedString(lbl.clone()).into()
+                    )),
+                });
+            }
+            
+            // Add property conditions if present
+            if let Some(props) = properties {
+                for (prop_name, prop_value) in props {
+                    let json_path = format!("$.{}", prop_name);
+                    let json_extract = Expr::Function(Function {
+                        name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("json_extract"))]),
+                        uses_odbc_syntax: false,
+                        parameters: FunctionArguments::None,
+                        args: FunctionArguments::List(FunctionArgumentList {
+                            duplicate_treatment: None,
+                            args: vec![
+                                FunctionArg::Unnamed(FunctionArgExpr::Expr(
+                                    Expr::Identifier(Ident::new("properties"))
+                                )),
+                                FunctionArg::Unnamed(FunctionArgExpr::Expr(
+                                    Expr::Value(Value::SingleQuotedString(json_path).into())
+                                )),
+                            ],
+                            clauses: vec![],
+                        }),
+                        filter: None,
+                        null_treatment: None,
+                        over: None,
+                        within_group: vec![],
+                    });
+                    
+                    conditions.push(Expr::BinaryOp {
+                        left: Box::new(json_extract),
+                        op: BinaryOperator::Eq,
+                        right: Box::new(Expr::Value(
+                            Value::SingleQuotedString(prop_value.clone()).into()
+                        )),
+                    });
+                }
+            }
+            
+            // Combine all conditions with AND
+            let selection = if conditions.is_empty() {
+                None
+            } else if conditions.len() == 1 {
+                Some(conditions.pop().unwrap())
+            } else {
+                // Build nested AND expressions
+                let mut expr = conditions.remove(0);
+                for cond in conditions {
+                    expr = Expr::BinaryOp {
+                        left: Box::new(expr),
+                        op: BinaryOperator::And,
+                        right: Box::new(cond),
+                    };
+                }
+                Some(expr)
+            };
+            
+            let table = TableFactor::Table {
+                name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(&table_name))]),
+                alias: None,
+                args: None,
+                with_hints: vec![],
+                version: None,
+                with_ordinality: false,
+                partitions: vec![],
+                json_path: None,
+                sample: None,
+                index_hints: vec![],
+            };
+            
+            let table_with_joins = TableWithJoins {
+                relation: table,
+                joins: vec![],
+            };
+            
+            let delete = Delete {
+                delete_token: AttachedToken::empty(),
+                tables: vec![],
+                from: FromTable::WithFromKeyword(vec![table_with_joins]),
+                using: None,
+                selection,
+                returning: None,
+                order_by: vec![],
+                limit: None,
+            };
+            
+            Statement::Delete(delete)
+        }
+        _ => s.clone(),
+    }
+}
+
+fn handle_create_relationship(s: &Statement) -> Statement {
+    match s {
+        Statement::CypherCreateRelationship {
+            from_node,
+            from_label,
+            from_properties,
+            to_node,
+            to_label,
+            to_properties,
+            rel_type,
+            properties: _,
+        } => {
+            // Build WHERE conditions for the from_node
+            let mut from_conditions = Vec::new();
+            
+            if let Some(label) = from_label {
+                from_conditions.push(Expr::BinaryOp {
+                    left: Box::new(Expr::Identifier(Ident::new("label"))),
+                    op: BinaryOperator::Eq,
+                    right: Box::new(Expr::Value(
+                        Value::SingleQuotedString(label.clone()).into()
+                    )),
+                });
+            }
+            
+            if let Some(props) = from_properties {
+                for (prop_name, prop_value) in props {
+                    let json_path = format!("$.{}", prop_name);
+                    let json_extract = Expr::Function(Function {
+                        name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("json_extract"))]),
+                        uses_odbc_syntax: false,
+                        parameters: FunctionArguments::None,
+                        args: FunctionArguments::List(FunctionArgumentList {
+                            duplicate_treatment: None,
+                            args: vec![
+                                FunctionArg::Unnamed(FunctionArgExpr::Expr(
+                                    Expr::Identifier(Ident::new("properties"))
+                                )),
+                                FunctionArg::Unnamed(FunctionArgExpr::Expr(
+                                    Expr::Value(Value::SingleQuotedString(json_path).into())
+                                )),
+                            ],
+                            clauses: vec![],
+                        }),
+                        filter: None,
+                        null_treatment: None,
+                        over: None,
+                        within_group: vec![],
+                    });
+                    
+                    from_conditions.push(Expr::BinaryOp {
+                        left: Box::new(json_extract),
+                        op: BinaryOperator::Eq,
+                        right: Box::new(Expr::Value(
+                            Value::SingleQuotedString(prop_value.clone()).into()
+                        )),
+                    });
+                }
+            }
+            
+            // Combine from_conditions with AND
+            let from_where = if from_conditions.is_empty() {
+                None
+            } else if from_conditions.len() == 1 {
+                Some(from_conditions.pop().unwrap())
+            } else {
+                let mut expr = from_conditions.remove(0);
+                for cond in from_conditions {
+                    expr = Expr::BinaryOp {
+                        left: Box::new(expr),
+                        op: BinaryOperator::And,
+                        right: Box::new(cond),
+                    };
+                }
+                Some(expr)
+            };
+            
+            // Build WHERE conditions for the to_node (same logic)
+            let mut to_conditions = Vec::new();
+            
+            if let Some(label) = to_label {
+                to_conditions.push(Expr::BinaryOp {
+                    left: Box::new(Expr::Identifier(Ident::new("label"))),
+                    op: BinaryOperator::Eq,
+                    right: Box::new(Expr::Value(
+                        Value::SingleQuotedString(label.clone()).into()
+                    )),
+                });
+            }
+            
+            if let Some(props) = to_properties {
+                for (prop_name, prop_value) in props {
+                    let json_path = format!("$.{}", prop_name);
+                    let json_extract = Expr::Function(Function {
+                        name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("json_extract"))]),
+                        uses_odbc_syntax: false,
+                        parameters: FunctionArguments::None,
+                        args: FunctionArguments::List(FunctionArgumentList {
+                            duplicate_treatment: None,
+                            args: vec![
+                                FunctionArg::Unnamed(FunctionArgExpr::Expr(
+                                    Expr::Identifier(Ident::new("properties"))
+                                )),
+                                FunctionArg::Unnamed(FunctionArgExpr::Expr(
+                                    Expr::Value(Value::SingleQuotedString(json_path).into())
+                                )),
+                            ],
+                            clauses: vec![],
+                        }),
+                        filter: None,
+                        null_treatment: None,
+                        over: None,
+                        within_group: vec![],
+                    });
+                    
+                    to_conditions.push(Expr::BinaryOp {
+                        left: Box::new(json_extract),
+                        op: BinaryOperator::Eq,
+                        right: Box::new(Expr::Value(
+                            Value::SingleQuotedString(prop_value.clone()).into()
+                        )),
+                    });
+                }
+            }
+            
+            // Combine to_conditions with AND
+            let to_where = if to_conditions.is_empty() {
+                None
+            } else if to_conditions.len() == 1 {
+                Some(to_conditions.pop().unwrap())
+            } else {
+                let mut expr = to_conditions.remove(0);
+                for cond in to_conditions {
+                    expr = Expr::BinaryOp {
+                        left: Box::new(expr),
+                        op: BinaryOperator::And,
+                        right: Box::new(cond),
+                    };
+                }
+                Some(expr)
+            };
+            
+            // Build FROM clause for from_node subquery
+            let from_table = TableFactor::Table {
+                name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("nodes"))]),
+                alias: None,
+                args: None,
+                with_hints: vec![],
+                version: None,
+                with_ordinality: false,
+                partitions: vec![],
+                json_path: None,
+                sample: None,
+                index_hints: vec![],
+            };
+            
+            let from_table_with_joins = TableWithJoins {
+                relation: from_table,
+                joins: vec![],
+            };
+            
+            // Create subquery for from_node: (SELECT id FROM nodes WHERE ...)
+            let from_subquery = Query {
+                with: None,
+                body: Box::new(SetExpr::Select(Box::new(Select {
+                    select_token: AttachedToken::empty(),
+                    distinct: None,
+                    top: None,
+                    top_before_distinct: false,
+                    projection: vec![
+                        SelectItem::UnnamedExpr(Expr::Identifier(Ident::new("id"))),
+                    ],
+                    exclude: None,
+                    into: None,
+                    from: vec![from_table_with_joins],
+                    lateral_views: vec![],
+                    prewhere: None,
+                    selection: from_where,
+                    group_by: GroupByExpr::Expressions(vec![], vec![]),
+                    cluster_by: vec![],
+                    distribute_by: vec![],
+                    sort_by: vec![],
+                    having: None,
+                    named_window: vec![],
+                    qualify: None,
+                    window_before_qualify: false,
+                    value_table_mode: None,
+                    connect_by: None,
+                    flavor: SelectFlavor::Standard,
+                }))),
+                order_by: None,
+                limit_clause: None,
+                fetch: None,
+                locks: vec![],
+                for_clause: None,
+                settings: None,
+                format_clause: None,
+                pipe_operators: vec![],
+            };
+            
+            // Build FROM clause for to_node subquery
+            let to_table = TableFactor::Table {
+                name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("nodes"))]),
+                alias: None,
+                args: None,
+                with_hints: vec![],
+                version: None,
+                with_ordinality: false,
+                partitions: vec![],
+                json_path: None,
+                sample: None,
+                index_hints: vec![],
+            };
+            
+            let to_table_with_joins = TableWithJoins {
+                relation: to_table,
+                joins: vec![],
+            };
+            
+            // Create subquery for to_node: (SELECT id FROM nodes WHERE ...)
+            let to_subquery = Query {
+                with: None,
+                body: Box::new(SetExpr::Select(Box::new(Select {
+                    select_token: AttachedToken::empty(),
+                    distinct: None,
+                    top: None,
+                    top_before_distinct: false,
+                    projection: vec![
+                        SelectItem::UnnamedExpr(Expr::Identifier(Ident::new("id"))),
+                    ],
+                    exclude: None,
+                    into: None,
+                    from: vec![to_table_with_joins],
+                    lateral_views: vec![],
+                    prewhere: None,
+                    selection: to_where,
+                    group_by: GroupByExpr::Expressions(vec![], vec![]),
+                    cluster_by: vec![],
+                    distribute_by: vec![],
+                    sort_by: vec![],
+                    having: None,
+                    named_window: vec![],
+                    qualify: None,
+                    window_before_qualify: false,
+                    value_table_mode: None,
+                    connect_by: None,
+                    flavor: SelectFlavor::Standard,
+                }))),
+                order_by: None,
+                limit_clause: None,
+                fetch: None,
+                locks: vec![],
+                for_clause: None,
+                settings: None,
+                format_clause: None,
+                pipe_operators: vec![],
+            };
+            
+            // Build VALUES rows with the subqueries
+            let rows = vec![vec![
+                Expr::Subquery(Box::new(from_subquery)),
+                Expr::Subquery(Box::new(to_subquery)),
+                Expr::Value(Value::SingleQuotedString(rel_type.clone()).into()),
+                Expr::Value(Value::SingleQuotedString("{}".to_string()).into()),
+            ]];
+            
+            let table_name = ObjectName(vec![
+                ObjectNamePart::Identifier(Ident::new("edges"))
+            ]);
+
+            
+            let insert = Insert {
+                insert_token: AttachedToken::empty(),
+                or: None,
+                ignore: false,
+                into: true,
+                table: TableObject::TableName(table_name),
+                table_alias: None,
+                columns: vec![
+                    Ident::new("src_id"),
+                    Ident::new("dst_id"),
+                    Ident::new("type"),
+                    Ident::new("properties"),
+                ],
+                overwrite: false,
+                source: Some(Box::new(Query {
+                    with: None,
+                    body: Box::new(SetExpr::Values(Values {
+                        explicit_row: false,
+                        value_keyword: false,
+                        rows,
+                    })),
+                    order_by: None,
+                    limit_clause: None,
+                    fetch: None,
+                    locks: vec![],
+                    for_clause: None,
+                    settings: None,
+                    format_clause: None,
+                    pipe_operators: vec![],
+                })),
+                assignments: vec![],
+                partitioned: None,
+                after_columns: vec![],
+                has_table_keyword: false,
+                on: None,
+                returning: None,
+                replace_into: false,
+                priority: None,
+                insert_alias: None,
+                settings: None,
+                format_clause: None,
+            };
+            
+            Statement::Insert(insert)
+        }
+        _ => s.clone(),
+    }
+}
+
+impl Statement {
+    pub fn desugar_cypher_to_sql(&self) -> Self {
+        match self {
+            Statement::CypherMatchNode { 
+                node_name: _,
+                label: _,
+                properties: _,
+                return_for_match: _,
+            } => {
+                // construct an SQL Query obj
+                handle_match_node(self)
+            }
+            Statement::CypherCreate { node_name: _, label: _, properties: _ } => {
+                // construct an INSERT statement
+                handle_create_node(self)
+            }
+            Statement::CypherDelete { node_or_edge_name: _, is_edge: _, detach: _, label: _, properties: _ } => {
+                // construct a DELETE statement
+                handle_delete_node(self)
+            }
+            Statement::CypherCreateRelationship { from_node: _, from_label: _, from_properties: _, to_node: _, to_label: _, to_properties: _, rel_type: _, properties: _ } => {
+                // construct an INSERT statement with subqueries
+                handle_create_relationship(self)
+            }
+            _ => self.clone(),
+        }
+    }
 }
 
 impl From<Analyze> for Statement {
@@ -5872,7 +6574,7 @@ impl fmt::Display for Statement {
                 Ok(())
             }
 
-            Statement::CypherDelete { node_or_edge_name, is_edge, detach } => {
+            Statement::CypherDelete { node_or_edge_name, is_edge, detach, label, properties } => {
                 if *is_edge {
                     write!(f, "DELETE FROM edges WHERE id = ?")  // Will need variable binding
                 } else if *detach {
@@ -5882,7 +6584,7 @@ impl fmt::Display for Statement {
                 }
             }
 
-            Statement::CypherCreateRelationship { from_node, to_node, rel_type, properties } => {
+            Statement::CypherCreateRelationship { from_node, from_label, from_properties, to_node, to_label, to_properties, rel_type, properties } => {
                 if let Some(props) = properties {
                     let json_props = props.iter()
                         .map(|(k, v)| format!("\"{}\":\"{}\"", k, v))

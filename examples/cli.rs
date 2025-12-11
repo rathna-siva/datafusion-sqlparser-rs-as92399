@@ -63,14 +63,14 @@ $ cargo run --example cli - [--dialectname]
     };
 
     let contents = if filename == "-" {
-        println!("Parsing from stdin using {dialect:?}");
+        //println!("Parsing from stdin using {dialect:?}");
         let mut buf = Vec::new();
         stdin()
             .read_to_end(&mut buf)
             .expect("failed to read from stdin");
         String::from_utf8(buf).expect("stdin content wasn't valid utf8")
     } else {
-        println!("Parsing from file '{}' using {:?}", &filename, dialect);
+        //println!("Parsing from file '{}' using {:?}", &filename, dialect);
         fs::read_to_string(&filename)
             .unwrap_or_else(|_| panic!("Unable to read the file {}", &filename))
     };
@@ -84,8 +84,15 @@ $ cargo run --example cli - [--dialectname]
     let parse_result = Parser::parse_sql(&*dialect, without_bom);
     match parse_result {
         Ok(statements) => {
+            // desugar
+            let statements: Vec<_> = statements
+                .iter()
+                .map(|stmt| stmt.desugar_cypher_to_sql())
+                .collect();
+                
+
             println!(
-                "Round-trip:\n'{}'",
+                "{}",
                 statements
                     .iter()
                     .map(std::string::ToString::to_string)
@@ -97,10 +104,10 @@ $ cargo run --example cli - [--dialectname]
                 #[cfg(feature = "json_example")]
                 {
                     let serialized = serde_json::to_string_pretty(&statements).unwrap();
-                    println!("Serialized as JSON:\n{serialized}");
+                    //println!("Serialized as JSON:\n{serialized}");
                 }
             } else {
-                println!("Parse results:\n{statements:#?}");
+                //println!("Parse results:\n{statements:#?}");
             }
 
             std::process::exit(0);
