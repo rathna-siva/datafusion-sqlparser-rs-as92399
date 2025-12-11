@@ -17986,8 +17986,12 @@ impl<'a> Parser<'a> {
         self.expect_keyword(Keyword::MATCH)?;
         self.expect_token(&Token::LParen)?;
         
-        // Check if it's an edge pattern: (a)-[r]->(b)
-        let first_var = self.parse_identifier()?.to_string();
+        // Check if it's an anonymous node () or a named node
+        let first_var = if matches!(self.peek_token().token, Token::RParen) {
+            "_anonymous".to_string()
+        } else {
+            self.parse_identifier()?.to_string()
+        };
         
         if self.consume_token(&Token::RParen) {
             // Check for edge pattern: )-[
@@ -18006,8 +18010,27 @@ impl<'a> Parser<'a> {
                 self.expect_token(&Token::Arrow)?;
                 self.expect_token(&Token::LParen)?;
                 
-                let to_node = self.parse_identifier()?.to_string();
+                // Check if it's an anonymous node () or a named node
+                let to_node = if matches!(self.peek_token().token, Token::RParen) {
+                    "_anonymous".to_string()
+                } else {
+                    self.parse_identifier()?.to_string()
+                };
                 self.expect_token(&Token::RParen)?;
+                
+                // Check for DELETE after edge pattern
+                if self.peek_keyword(Keyword::DELETE) {
+                    self.expect_keyword(Keyword::DELETE)?;
+                    let _delete_var = self.parse_identifier()?.to_string();
+                    return Ok(Statement::CypherDelete {
+                        node_or_edge_name: edge_name,
+                        is_edge: true,
+                        detach: false,
+                        label: None,
+                        rel_type,
+                        properties: None,
+                    });
+                }
                 
                 // Parse RETURN if present
                 let return_for_match = if self.parse_keyword(Keyword::RETURN) {
@@ -18041,6 +18064,7 @@ impl<'a> Parser<'a> {
                         is_edge: false,
                         detach,
                         label: None,
+                        rel_type: None,
                         properties: None,
                     });
                 }
@@ -18119,6 +18143,7 @@ impl<'a> Parser<'a> {
                 is_edge: false,
                 detach,
                 label,
+                rel_type: None,
                 properties,
             });
         }
@@ -18260,6 +18285,7 @@ impl<'a> Parser<'a> {
             is_edge: false,  // TODO: detect from context
             detach,
             label: None,
+            rel_type: None,
             properties: None,
         })
     }

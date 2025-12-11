@@ -4306,6 +4306,7 @@ pub enum Statement {
         is_edge: bool,              
         detach: bool,
         label: Option<String>,
+        rel_type: Option<String>,
         properties: Option<Vec<(String, String)>>,
     },
     CypherCreateRelationship{
@@ -4550,6 +4551,96 @@ fn handle_create_node(s: &Statement) -> Statement {
     }
 }
 
+fn handle_match_edge(s: &Statement) -> Statement {
+    match s {
+        Statement::CypherMatchEdge {
+            from_node: _,
+            edge_name: _,
+            to_node: _,
+            rel_type,
+            return_for_match: _,
+        } => {
+            let select_token = AttachedToken::empty();
+            let projection = vec![
+                SelectItem::Wildcard(
+                    WildcardAdditionalOptions::default()
+                ),
+            ];
+            let table = TableFactor::Table {
+                name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("edges"))]),
+                alias: None,
+                args: None,
+                with_hints: vec![],
+                version: None,
+                with_ordinality: false,
+                partitions: vec![],
+                json_path: None,
+                sample: None,
+                index_hints: vec![],
+            };
+            let table_with_joins = TableWithJoins {
+                relation: table,
+                joins: vec![],
+            };
+            let from = vec![table_with_joins];
+            
+            // Build WHERE clause for relationship type if present
+            let selection = if let Some(rt) = rel_type {
+                Some(Expr::BinaryOp {
+                    left: Box::new(Expr::Identifier(Ident::new("type"))),
+                    op: BinaryOperator::Eq,
+                    right: Box::new(Expr::Value(
+                        Value::SingleQuotedString(rt.clone()).into()
+                    )),
+                })
+            } else {
+                None
+            };
+            
+            let select = Select {
+                select_token,
+                distinct: None,
+                top: None,
+                top_before_distinct: false,
+                projection,
+                exclude: None,
+                into: None,
+                from,
+                lateral_views: vec![],
+                prewhere: None,
+                selection,
+                group_by: GroupByExpr::Expressions(vec![], vec![]),
+                cluster_by: vec![],
+                distribute_by: vec![],
+                sort_by: vec![],
+                having: None,
+                named_window: vec![],
+                qualify: None,
+                window_before_qualify: false,
+                value_table_mode: None,
+                connect_by: None,
+                flavor: SelectFlavor::Standard,
+            };
+
+            let query = Query {
+                with: None,
+                body: Box::new(SetExpr::Select(Box::new(select))),
+                order_by: None,
+                limit_clause: None,
+                fetch: None,
+                locks: vec![],
+                for_clause: None,
+                settings: None,
+                format_clause: None,
+                pipe_operators: vec![],
+            };
+
+            Statement::Query(Box::new(query))
+        }
+        _ => s.clone(),
+    }
+}
+
 fn handle_delete_node(s: &Statement) -> Statement {
     match s {
         Statement::CypherDelete {
@@ -4557,6 +4648,7 @@ fn handle_delete_node(s: &Statement) -> Statement {
             is_edge,
             detach: _,
             label,
+            rel_type,
             properties,
         } => {
             let table_name = if *is_edge {
@@ -4574,6 +4666,17 @@ fn handle_delete_node(s: &Statement) -> Statement {
                     op: BinaryOperator::Eq,
                     right: Box::new(Expr::Value(
                         Value::SingleQuotedString(lbl.clone()).into()
+                    )),
+                });
+            }
+            
+            // Add relationship type condition if present
+            if let Some(rel) = rel_type {
+                conditions.push(Expr::BinaryOp {
+                    left: Box::new(Expr::Identifier(Ident::new("type"))),
+                    op: BinaryOperator::Eq,
+                    right: Box::new(Expr::Value(
+                        Value::SingleQuotedString(rel.clone()).into()
                     )),
                 });
             }
@@ -4999,11 +5102,21 @@ impl Statement {
                 // construct an SQL Query obj
                 handle_match_node(self)
             }
+            Statement::CypherMatchEdge {
+                from_node: _,
+                edge_name: _,
+                to_node: _,
+                rel_type: _,
+                return_for_match: _,
+            } => {
+                // construct a SELECT query from edges table
+                handle_match_edge(self)
+            }
             Statement::CypherCreate { node_name: _, label: _, properties: _ } => {
                 // construct an INSERT statement
                 handle_create_node(self)
             }
-            Statement::CypherDelete { node_or_edge_name: _, is_edge: _, detach: _, label: _, properties: _ } => {
+            Statement::CypherDelete { node_or_edge_name: _, is_edge: _, detach: _, label: _, rel_type: _, properties: _ } => {
                 // construct a DELETE statement
                 handle_delete_node(self)
             }
@@ -6574,7 +6687,7 @@ impl fmt::Display for Statement {
                 Ok(())
             }
 
-            Statement::CypherDelete { node_or_edge_name, is_edge, detach, label, properties } => {
+            Statement::CypherDelete { node_or_edge_name, is_edge, detach, label, rel_type, properties } => {
                 if *is_edge {
                     write!(f, "DELETE FROM edges WHERE id = ?")  // Will need variable binding
                 } else if *detach {
